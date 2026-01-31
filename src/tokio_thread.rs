@@ -12,17 +12,20 @@ use crate::{
     upload,
     util::version::is_version_newer,
 };
+use backoff::{ExponentialBackoff, backoff::Backoff};
 use std::{
     collections::HashMap,
     io::Cursor,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use color_eyre::{Result, eyre::Context};
 
-use constants::{GH_ORG, GH_REPO, MAX_FOOTAGE, MAX_IDLE_DURATION, supported_games::SupportedGames};
+use constants::{
+    GH_ORG, GH_REPO, MAX_FOOTAGE, MAX_IDLE_DURATION, unsupported_games::UnsupportedGames,
+};
 use game_process::does_process_exist;
 use input_capture::{Event, InputCapture};
 use rodio::{Decoder, Sink, Source};
@@ -136,6 +139,10 @@ async fn main(
         actively_recording_window: None,
     };
 
+    // Offline backoff state
+    let mut offline_backoff: Option<ExponentialBackoff> = None;
+    let mut offline_backoff_handle: Option<tokio::task::JoinHandle<()>> = None;
+
     // Initial async requests to GitHub/server
     tracing::debug!("Spawning startup requests task");
     tokio::spawn(startup_requests(app_state.clone()));
@@ -184,44 +191,38 @@ async fn main(
                 };
                 match e {
                     AsyncRequest::ValidateApiKey { api_key } => {
-                        // Check if offline mode is enabled
-                        if app_state.offline_mode.load(std::sync::atomic::Ordering::SeqCst) {
-                            tracing::info!("Offline mode enabled, skipping API key validation");
-                            app_state.async_request_tx.send(AsyncRequest::SetOfflineMode { enabled: true, offline_reason: None }).await.ok();
-                        } else {
-                            let response = api_client.validate_api_key(&api_key).await;
-                            tracing::info!("Received response from API key validation: {response:?}");
+                        let response = api_client.validate_api_key(&api_key).await;
+                        tracing::info!("Received response from API key validation: {response:?}");
 
-                            match response {
-                                Err(e) if e.is_network_error() => {
-                                    // Network error or server unavailable (502/503/504) - switch to offline mode
-                                    tracing::warn!("API server unavailable, switching to offline mode: {e}");
-                                    app_state.async_request_tx.send(AsyncRequest::SetOfflineMode { enabled: true, offline_reason: Some(e.to_string()) }).await.ok();
-                                }
-                                Err(e) => {
-                                    // API key validation failed - don't switch to offline mode
-                                    tracing::warn!("API key validation failed: {e}");
-                                    app_state
-                                        .ui_update_tx
-                                        .send(UiUpdate::UpdateUserId(Err(e.to_string())))
-                                        .ok();
-                                }
-                                Ok(user_id) => {
-                                    valid_api_key_and_user_id = Some((api_key.clone(), user_id.clone()));
-                                    app_state
-                                        .ui_update_tx
-                                        .send(UiUpdate::UpdateUserId(Ok(user_id)))
-                                        .ok();
-
-                                    app_state.async_request_tx.send(AsyncRequest::LoadUploadStats).await.ok();
-                                }
+                        match response {
+                            Err(e) if e.is_network_error() => {
+                                // Network error or server unavailable (502/503/504) - switch to offline mode
+                                tracing::warn!("API server unavailable, switching to offline mode: {e}");
+                                app_state.async_request_tx.send(AsyncRequest::SetOfflineMode { enabled: true, offline_reason: Some(e.to_string()) }).await.ok();
                             }
-                            // no matter if offline or online, local recordings should be loaded
-                            app_state.async_request_tx.send(AsyncRequest::LoadLocalRecordings).await.ok();
+                            Err(e) => {
+                                // API key validation failed - don't switch to offline mode
+                                tracing::warn!("API key validation failed: {e}");
+                                app_state
+                                    .ui_update_tx
+                                    .send(UiUpdate::UpdateUserId(Err(e.to_string())))
+                                    .ok();
+                            }
+                            Ok(user_id) => {
+                                valid_api_key_and_user_id = Some((api_key.clone(), user_id.clone()));
+                                app_state
+                                    .ui_update_tx
+                                    .send(UiUpdate::UpdateUserId(Ok(user_id)))
+                                    .ok();
+
+                                app_state.async_request_tx.send(AsyncRequest::LoadUploadStats).await.ok();
+                            }
                         }
+                        // no matter if offline or online, local recordings should be loaded
+                        app_state.async_request_tx.send(AsyncRequest::LoadLocalRecordings).await.ok();
                     }
                     AsyncRequest::UploadData => {
-                        if app_state.offline_mode.load(std::sync::atomic::Ordering::SeqCst) {
+                        if app_state.offline.mode.load(Ordering::SeqCst) {
                             tracing::info!("Offline mode enabled, skipping upload");
                             app_state
                                 .ui_update_tx
@@ -232,11 +233,11 @@ async fn main(
                         }
                     }
                     AsyncRequest::PauseUpload => {
-                        app_state.upload_pause_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        app_state.upload_pause_flag.store(true, Ordering::SeqCst);
                         // Clear the auto-upload queue when pausing
                         let prev_queue_count = app_state
                             .auto_upload_queue_count
-                            .load(std::sync::atomic::Ordering::SeqCst);
+                            .load(Ordering::SeqCst);
                         tracing::info!(
                             "Upload pause requested, auto-upload queue cleared (was {prev_queue_count} recordings)"
                         );
@@ -256,18 +257,17 @@ async fn main(
                     AsyncRequest::OpenFolder(path) => {
                         opener::open(&path).ok();
                     }
-                    AsyncRequest::UpdateSupportedGames(new_games) => {
-                        let mut supported_games = app_state.supported_games.write().unwrap();
-                        let old_game_count = supported_games.games.len();
-                        *supported_games = new_games;
+                    AsyncRequest::UpdateUnsupportedGames(new_games) => {
+                        let mut unsupported_games = app_state.unsupported_games.write().unwrap();
+                        let old_game_count = unsupported_games.games.len();
+                        *unsupported_games = new_games;
                         tracing::info!(
-                            "Updated supported games: {old_game_count} -> {} total, {} installed",
-                            supported_games.games.len(),
-                            supported_games.installed().count()
+                            "Updated unsupported games: {old_game_count} -> {} total",
+                            unsupported_games.games.len(),
                         );
                     }
                     AsyncRequest::LoadUploadStats => {
-                        if app_state.offline_mode.load(std::sync::atomic::Ordering::SeqCst) {
+                        if app_state.offline.mode.load(Ordering::SeqCst) {
                             tracing::info!("Offline mode enabled, skipping upload stats load");
                             // Don't send any update - UI will show no upload stats
                         } else {
@@ -444,7 +444,7 @@ async fn main(
                         // Subtract the number of recordings that were just uploaded from the queue
                         let prev_count = app_state
                             .auto_upload_queue_count
-                            .load(std::sync::atomic::Ordering::SeqCst);
+                            .load(Ordering::SeqCst);
                         let new_count = prev_count.saturating_sub(uploaded_count);
 
                         tracing::info!(
@@ -472,7 +472,7 @@ async fn main(
                     AsyncRequest::ClearAutoUploadQueue => {
                         let prev_count = app_state
                             .auto_upload_queue_count
-                            .load(std::sync::atomic::Ordering::SeqCst);
+                            .load(Ordering::SeqCst);
                         tracing::info!(
                             "Auto-upload queue cleared (was {} recordings)",
                             prev_count
@@ -481,16 +481,171 @@ async fn main(
                     }
                     AsyncRequest::SetOfflineMode { enabled, offline_reason } => {
                         tracing::info!("Setting offline mode to {}", enabled);
-                        app_state.offline_mode.store(enabled, std::sync::atomic::Ordering::SeqCst);
-                        let mut offline_str = "Offline".to_string();
+                        app_state.offline.mode.store(enabled, Ordering::SeqCst);
 
-                        if let Some(reason) = offline_reason {
-                            offline_str.push_str(&format!(" ({reason})"));
+                        match (enabled, &offline_reason) {
+                            (true, Some(reason)) => {
+                                tracing::info!("Offline mode enabled: {}", reason);
+                                app_state.ui_update_tx.send(UiUpdate::UpdateUserId(Ok(format!("Offline ({reason})")))).ok();
+                                // trigger backoff attempts since offline mode enabled with error
+                                app_state.async_request_tx.send(AsyncRequest::OfflineBackoffAttempt).await.ok();
+                            },
+                            (true, None) => {
+                                tracing::info!("Offline mode enabled by user without error");
+                                app_state.ui_update_tx.send(UiUpdate::UpdateUserId(Ok("Offline".to_string()))).ok();
+                            },
+                            (false, _) => {
+                                tracing::info!("Offline mode disabled, going online");
+                                let api_key = app_state.config.read().unwrap().credentials.api_key.clone();
+                                app_state.ui_update_tx.send(UiUpdate::UpdateUserId(Ok("Authenticating...".to_string()))).ok();
+                                app_state.async_request_tx.send(AsyncRequest::CancelOfflineBackoff).await.ok();
+                                app_state.async_request_tx.send(AsyncRequest::ValidateApiKey { api_key }).await.ok();
+                                // Load data now that we're online
+                                app_state.async_request_tx.send(AsyncRequest::LoadUploadStats).await.ok();
+                                app_state.async_request_tx.send(AsyncRequest::LoadLocalRecordings).await.ok();
+                            },
                         }
-                        app_state
-                            .ui_update_tx
-                            .send(UiUpdate::UpdateUserId(Ok(offline_str)))
-                            .ok();
+                    }
+                    AsyncRequest::CancelOfflineBackoff => {
+                        tracing::info!("Cancelling offline backoff retry loop");
+                        if let Some(handle) = offline_backoff_handle.take() {
+                            handle.abort();
+                        }
+                        offline_backoff = None;
+                        app_state.offline.backoff_active.store(false, Ordering::SeqCst);
+                        app_state.offline.retry_count.store(0, Ordering::SeqCst);
+                        app_state.offline.next_retry_time.store(0, Ordering::SeqCst);
+                    }
+                    AsyncRequest::OfflineBackoffAttempt => {
+                        let backoff_active = app_state.offline.backoff_active.load(Ordering::SeqCst);
+                        let offline_mode = app_state.offline.mode.load(Ordering::SeqCst);
+
+                        match (backoff_active, offline_mode) {
+                            // Not offline - nothing to do
+                            (_, false) => {}
+
+                            // Offline but backoff not started - initialize backoff and schedule first retry
+                            (false, true) => {
+                                tracing::info!("Starting offline backoff retry loop");
+
+                                // Create new backoff with ~2.5 min initial, doubling, max 60 min
+                                // but never stops since max_elapsed_time is None. At max every hour
+                                // it will retry.
+                                let mut backoff = ExponentialBackoff {
+                                    initial_interval: Duration::from_secs(150),
+                                    current_interval: Duration::from_secs(150), // Must match initial_interval
+                                    max_interval: Duration::from_secs(3600),
+                                    max_elapsed_time: None,
+                                    multiplier: 2.0,
+                                    randomization_factor: 0.1,
+                                    ..Default::default()
+                                };
+
+                                // Get first interval and schedule retry
+                                if let Some(delay) = backoff.next_backoff() {
+                                    let next_retry_time = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs()
+                                        + delay.as_secs();
+
+                                    app_state.offline.backoff_active.store(true, Ordering::SeqCst);
+                                    app_state.offline.next_retry_time.store(next_retry_time, Ordering::SeqCst);
+                                    app_state.offline.retry_count.store(0, Ordering::SeqCst);
+
+                                    offline_backoff = Some(backoff);
+
+                                    // Cancel any existing handle
+                                    if let Some(handle) = offline_backoff_handle.take() {
+                                        handle.abort();
+                                    }
+
+                                    // Schedule the retry
+                                    tracing::info!("Scheduling offline retry in {:?}", delay);
+                                    offline_backoff_handle = Some(tokio::spawn({
+                                        let tx = app_state.async_request_tx.clone();
+                                        async move {
+                                            tokio::time::sleep(delay).await;
+                                            tx.send(AsyncRequest::OfflineBackoffAttempt).await.ok();
+                                        }
+                                    }));
+                                }
+                            }
+
+                            // Backoff active and still offline - attempt API validation
+                            (true, true) => {
+                                let retry_count = app_state.offline.retry_count.load(Ordering::SeqCst);
+                                tracing::info!("Offline backoff retry #{} - attempting API validation", retry_count + 1);
+                                let api_key = app_state.config.read().unwrap().credentials.api_key.clone();
+                                // Attempt validation
+                                let response = api_client.validate_api_key(&api_key).await;
+                                match response {
+                                    Ok(user_id) => {
+                                        // Successful server response, cancel backoff and go online
+                                        tracing::info!("Offline backoff retry succeeded, going online");
+                                        app_state.offline.mode.store(false, Ordering::SeqCst);
+                                        valid_api_key_and_user_id = Some((api_key.clone(), user_id.clone()));
+                                        app_state.ui_update_tx.send(UiUpdate::UpdateUserId(Ok(user_id))).ok();
+
+                                        // Cancel backoff
+                                        app_state.async_request_tx.send(AsyncRequest::SetOfflineMode { enabled: false, offline_reason: None }).await.ok();
+                                    }
+                                    Err(e) if e.is_network_error() => {
+                                        // Still offline, schedule next retry
+                                        tracing::warn!("Offline backoff retry #{} failed (network error): {}", retry_count + 1, e);
+
+                                        let new_retry_count = retry_count + 1;
+                                        app_state.offline.retry_count.store(new_retry_count, Ordering::SeqCst);
+
+                                        // Get next backoff delay (None if max_elapsed_time exceeded)
+                                        let next_delay = offline_backoff.as_mut().and_then(|b| b.next_backoff());
+
+                                        if let Some(delay) = next_delay {
+                                            let next_retry_time = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_secs()
+                                                + delay.as_secs();
+                                            app_state.offline.next_retry_time.store(next_retry_time, Ordering::SeqCst);
+
+                                            // Schedule next retry
+                                            tracing::info!("Scheduling next offline retry in {:?}", delay);
+                                            offline_backoff_handle = Some(tokio::spawn({
+                                                let tx = app_state.async_request_tx.clone();
+                                                async move {
+                                                    tokio::time::sleep(delay).await;
+                                                    tx.send(AsyncRequest::OfflineBackoffAttempt).await.ok();
+                                                }
+                                            }));
+                                        } else {
+                                            // Backoff exhausted (max_elapsed_time reached) - stop retrying
+                                            // This should never happen since we set max_elapsed_time to None, but just
+                                            // in case in the future we change that behaviour we don't get footgunned
+                                            tracing::warn!("Offline backoff exhausted, stopping retries");
+                                            offline_backoff = None;
+                                            app_state.offline.backoff_active.store(false, Ordering::SeqCst);
+                                            app_state.offline.retry_count.store(0, Ordering::SeqCst);
+                                            app_state.offline.next_retry_time.store(0, Ordering::SeqCst);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // Non-network error (e.g., invalid API key) - stop backoff
+                                        tracing::warn!("Offline backoff retry got non-network error, stopping: {}", e);
+
+                                        // Cancel backoff but stay offline
+                                        if let Some(handle) = offline_backoff_handle.take() {
+                                            handle.abort();
+                                        }
+                                        offline_backoff = None;
+                                        app_state.offline.backoff_active.store(false, Ordering::SeqCst);
+                                        app_state.offline.retry_count.store(0, Ordering::SeqCst);
+                                        app_state.offline.next_retry_time.store(0, Ordering::SeqCst);
+
+                                        app_state.ui_update_tx.send(UiUpdate::UpdateUserId(Err(e.to_string()))).ok();
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             },
@@ -503,7 +658,14 @@ async fn main(
                     tracing::error!(e=?e, "Failed to flush input events");
                 }
                 // Check foregrounded game
-                *app_state.last_foregrounded_game.write().unwrap() = get_foregrounded_game(&app_state.supported_games.read().unwrap(), &state.recorder);
+                let foregrounded = get_foregrounded_game(&app_state.unsupported_games.read().unwrap(), &state.recorder);
+                if let Some(ref fg) = foregrounded
+                    && fg.is_recordable()
+                    && fg.exe_name.is_some()
+                {
+                    *app_state.last_recordable_game.write().unwrap() = fg.exe_name.clone();
+                }
+                *app_state.last_foregrounded_game.write().unwrap() = foregrounded;
                 // Tick state machine
                 state.tick().await;
                 // Periodically force the UI to rerender so that it will process events, even if not visible
@@ -563,11 +725,7 @@ impl State {
         self.last_active = Instant::now();
         if let Err(e) = match (&self.recording_state, e.key_press_keycode()) {
             (RecordingState::Idle, key) if key == start_key => {
-                if self
-                    .app_state
-                    .is_out_of_date
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
+                if self.app_state.is_out_of_date.load(Ordering::SeqCst) {
                     error_message_box(concat!(
                         "You are using an outdated version of OWL Control. ",
                         "Please update to the latest version to continue.\n\n",
@@ -727,11 +885,11 @@ impl State {
             (RecordingState::Idle | RecordingState::Paused { .. }, RecordingState::Recording) => {
                 // Start recording from Idle or Paused state
                 let honk = self.app_state.config.read().unwrap().preferences.honk;
-                let supported_games = self.app_state.supported_games.read().unwrap().clone();
+                let unsupported_games = self.app_state.unsupported_games.read().unwrap().clone();
                 start_recording_safely(
                     &mut self.recorder,
                     &self.input_capture,
-                    &supported_games,
+                    &unsupported_games,
                     Some((&self.sink, honk, &self.app_state)),
                     &mut self.cue_cache,
                 )
@@ -843,7 +1001,7 @@ impl State {
                 // Restart the currently active recording
                 // Here we intentionally set honk to false, we don't want audio cue to occur
                 // on an intended recording restart and confuse the user
-                let supported_games = self.app_state.supported_games.read().unwrap().clone();
+                let unsupported_games = self.app_state.unsupported_games.read().unwrap().clone();
                 stop_recording_with_notification(
                     &mut self.recorder,
                     &self.input_capture,
@@ -854,7 +1012,7 @@ impl State {
                 start_recording_safely(
                     &mut self.recorder,
                     &self.input_capture,
-                    &supported_games,
+                    &unsupported_games,
                     Some((&self.sink, false, &self.app_state)),
                     &mut self.cue_cache,
                 )
@@ -885,17 +1043,14 @@ impl State {
             return;
         }
 
-        let upload_in_progress = self
-            .app_state
-            .upload_in_progress
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let upload_in_progress = self.app_state.upload_in_progress.load(Ordering::SeqCst);
 
         if upload_in_progress {
             // Upload already in progress, queue this one
             let current_count = self
                 .app_state
                 .auto_upload_queue_count
-                .load(std::sync::atomic::Ordering::SeqCst);
+                .load(Ordering::SeqCst);
             let new_count = current_count + 1;
             tracing::info!(
                 "Auto-upload: upload in progress, queued recording (queue count: {})",
@@ -922,11 +1077,11 @@ impl State {
 async fn start_recording_safely(
     recorder: &mut Recorder,
     input_capture: &InputCapture,
-    supported_games: &SupportedGames,
+    unsupported_games: &UnsupportedGames,
     notification_state: Option<(&Sink, bool, &AppState)>,
     cue_cache: &mut HashMap<String, Vec<u8>>,
 ) -> Result<()> {
-    if let Err(e) = recorder.start(input_capture, supported_games).await {
+    if let Err(e) = recorder.start(input_capture, unsupported_games).await {
         tracing::error!(e=?e, "Failed to start recording");
         error_message_box(&e.to_string());
         recorder.stop(input_capture).await.ok();
@@ -1023,7 +1178,7 @@ fn play_cue(
 fn set_auto_upload_queue_count(app_state: &AppState, count: usize) {
     app_state
         .auto_upload_queue_count
-        .store(count, std::sync::atomic::Ordering::SeqCst);
+        .store(count, Ordering::SeqCst);
     app_state
         .ui_update_tx
         .send(UiUpdate::UpdateAutoUploadQueueCount(count))
@@ -1047,21 +1202,19 @@ fn is_window_focused(hwnd: HWND) -> bool {
 }
 
 fn get_foregrounded_game(
-    supported_games: &SupportedGames,
+    unsupported_games: &UnsupportedGames,
     recorder: &Recorder,
 ) -> Option<ForegroundedGame> {
     let (exe_name, _, hwnd) = crate::record::get_foregrounded_game().ok().flatten()?;
 
-    // Check if game is supported
     let exe_without_ext = std::path::Path::new(&exe_name)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(&exe_name)
         .to_lowercase();
 
-    let supported_game = supported_games.get(&exe_without_ext.clone());
-    let unsupported_reason = if supported_game.is_none() {
-        Some("Not on the games list.".to_string())
+    let unsupported_reason = if let Some(unsupported) = unsupported_games.get(&exe_without_ext) {
+        Some(unsupported.reason.to_string())
     } else if !recorder.is_window_capturable(hwnd) {
         Some(
             "Recorder cannot capture this window. Try running OWL Control in admin mode."
@@ -1203,20 +1356,20 @@ async fn move_recordings_folder(app_state: Arc<AppState>, from: PathBuf, to: Pat
 
 async fn startup_requests(app_state: Arc<AppState>) {
     if cfg!(debug_assertions) {
-        tracing::info!("Skipping fetch of supported games in dev/debug build");
+        tracing::info!("Skipping fetch of unsupported games in dev/debug build");
     } else {
         tokio::spawn({
             let async_request_tx = app_state.async_request_tx.clone();
             async move {
-                match get_supported_games().await {
+                match get_unsupported_games().await {
                     Ok(games) => {
                         async_request_tx
-                            .send(AsyncRequest::UpdateSupportedGames(games))
+                            .send(AsyncRequest::UpdateUnsupportedGames(games))
                             .await
                             .ok();
                     }
                     Err(e) => {
-                        tracing::error!(e=?e, "Failed to get supported games from GitHub");
+                        tracing::error!(e=?e, "Failed to get unsupported games from GitHub");
                     }
                 }
             }
@@ -1230,20 +1383,15 @@ async fn startup_requests(app_state: Arc<AppState>) {
     });
 }
 
-async fn get_supported_games() -> Result<SupportedGames> {
-    let text = reqwest::get(format!("https://raw.githubusercontent.com/{GH_ORG}/{GH_REPO}/refs/heads/main/crates/constants/src/supported_games.json"))
+async fn get_unsupported_games() -> Result<UnsupportedGames> {
+    let text = reqwest::get(format!("https://raw.githubusercontent.com/{GH_ORG}/{GH_REPO}/refs/heads/main/crates/constants/src/unsupported_games.json"))
         .await
-        .context("Failed to request supported games from GitHub")?
+        .context("Failed to request unsupported games from GitHub")?
         .text()
         .await
-        .context("Failed to get text of supported games from GitHub")?;
+        .context("Failed to get text of unsupported games from GitHub")?;
 
-    // Use spawn_blocking since load_from_str now does Steam detection (blocking I/O)
-    tokio::task::spawn_blocking(move || {
-        SupportedGames::load_from_str(&text).context("Failed to parse supported games from GitHub")
-    })
-    .await
-    .unwrap()
+    UnsupportedGames::load_from_str(&text).context("Failed to parse unsupported games from GitHub")
 }
 
 async fn check_for_updates(app_state: Arc<AppState>) -> Result<()> {
@@ -1309,9 +1457,7 @@ async fn check_for_updates(app_state: Arc<AppState>) -> Result<()> {
             }))
             .ok();
 
-        app_state
-            .is_out_of_date
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        app_state.is_out_of_date.store(true, Ordering::SeqCst);
     }
 
     Ok(())

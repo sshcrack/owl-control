@@ -2,12 +2,12 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, OnceLock, RwLock,
-        atomic::{AtomicBool, AtomicUsize},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize},
     },
     time::{Duration, Instant},
 };
 
-use constants::{encoding::VideoEncoderType, supported_games::SupportedGames};
+use constants::{encoding::VideoEncoderType, unsupported_games::UnsupportedGames};
 use egui_wgpu::wgpu;
 use tokio::sync::{broadcast, mpsc};
 
@@ -33,9 +33,35 @@ pub struct AppState {
     pub is_out_of_date: AtomicBool,
     pub play_time_state: RwLock<PlayTimeTracker>,
     pub last_foregrounded_game: RwLock<Option<ForegroundedGame>>,
-    pub supported_games: RwLock<SupportedGames>,
+    /// The exe name (e.g. "game.exe") of the last application that was recognised as recordable.
+    /// Used by the games settings UI to offer per-game configuration.
+    pub last_recordable_game: RwLock<Option<String>>,
+    pub unsupported_games: RwLock<UnsupportedGames>,
+    /// Offline mode state
+    pub offline: OfflineState,
+}
+
+/// State for offline mode and backoff retry logic
+pub struct OfflineState {
     /// Flag for offline mode - skips API server calls when enabled
-    pub offline_mode: AtomicBool,
+    pub mode: AtomicBool,
+    /// Whether offline backoff retry is currently active
+    pub backoff_active: AtomicBool,
+    /// Timestamp (as seconds since UNIX epoch) of when the next offline retry will occur
+    pub next_retry_time: AtomicU64,
+    /// Current retry count for offline backoff (used to display in UI)
+    pub retry_count: AtomicU32,
+}
+
+impl Default for OfflineState {
+    fn default() -> Self {
+        Self {
+            mode: AtomicBool::new(false),
+            backoff_active: AtomicBool::new(false),
+            next_retry_time: AtomicU64::new(0),
+            retry_count: AtomicU32::new(0),
+        }
+    }
 }
 impl AppState {
     pub fn new(
@@ -60,8 +86,9 @@ impl AppState {
             is_out_of_date: AtomicBool::new(false),
             play_time_state: RwLock::new(PlayTimeTracker::load()),
             last_foregrounded_game: RwLock::new(None),
-            supported_games: RwLock::new(SupportedGames::load_from_embedded()),
-            offline_mode: AtomicBool::new(false),
+            last_recordable_game: RwLock::new(None),
+            unsupported_games: RwLock::new(UnsupportedGames::load_from_embedded()),
+            offline: OfflineState::default(),
         };
         tracing::debug!("AppState::new() complete");
         state
@@ -143,7 +170,7 @@ pub enum AsyncRequest {
     PauseUpload,
     OpenDataDump,
     OpenLog,
-    UpdateSupportedGames(SupportedGames),
+    UpdateUnsupportedGames(UnsupportedGames),
     LoadUploadStats,
     LoadLocalRecordings,
     DeleteAllInvalidRecordings,
@@ -171,6 +198,10 @@ pub enum AsyncRequest {
         enabled: bool,
         offline_reason: Option<String>,
     },
+    /// Attempt to go online with backoff - starts backoff if not active, or retries if active
+    OfflineBackoffAttempt,
+    /// Cancel the offline mode backoff retry loop
+    CancelOfflineBackoff,
 }
 
 /// A message sent to the UI thread, usually in response to some action taken in another thread
