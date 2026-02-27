@@ -215,7 +215,8 @@ async fn main(
                                     .send(UiUpdate::UpdateUserId(Ok(user_id)))
                                     .ok();
 
-                                app_state.async_request_tx.send(AsyncRequest::LoadUploadStats).await.ok();
+                                app_state.async_request_tx.send(AsyncRequest::LoadUploadStatistics).await.ok();
+                                app_state.async_request_tx.send(AsyncRequest::load_upload_list_default()).await.ok();
                             }
                         }
                         // no matter if offline or online, local recordings should be loaded
@@ -228,6 +229,10 @@ async fn main(
                                 .ui_update_tx
                                 .send(UiUpdate::UploadFailed("Offline mode is enabled. Uploads are disabled.".to_string()))
                                 .ok();
+                        } else if app_state.upload_in_progress.compare_exchange(
+                            false, true, Ordering::SeqCst, Ordering::SeqCst
+                        ).is_err() {
+                            tracing::info!("Upload already in progress, skipping duplicate UploadData request");
                         } else {
                             tokio::spawn(upload::start(app_state.clone(), api_client.clone(), recording_location.clone()));
                         }
@@ -266,31 +271,62 @@ async fn main(
                             unsupported_games.games.len(),
                         );
                     }
-                    AsyncRequest::LoadUploadStats => {
+                    AsyncRequest::LoadUploadStatistics => {
                         if app_state.offline.mode.load(Ordering::SeqCst) {
-                            tracing::info!("Offline mode enabled, skipping upload stats load");
-                            // Don't send any update - UI will show no upload stats
+                            tracing::info!("Offline mode enabled, skipping upload statistics load");
                         } else {
                             match valid_api_key_and_user_id.clone() {
                                 Some((api_key, user_id)) => {
+                                    let start_date = app_state.upload_filters.read().unwrap().start_date;
+                                    let end_date = app_state.upload_filters.read().unwrap().end_date;
                                     tokio::spawn({
                                         let app_state = app_state.clone();
                                         let api_client = api_client.clone();
                                         async move {
-                                            let stats = match api_client.get_user_upload_stats(&api_key, &user_id).await {
+                                            let stats = match api_client.get_user_upload_statistics(&api_key, &user_id, start_date, end_date).await {
                                                 Ok(stats) => stats,
                                                 Err(e) => {
-                                                    tracing::error!(e=?e, "Failed to get user upload stats");
+                                                    tracing::error!(e=?e, "Failed to get user upload statistics");
                                                     return;
                                                 }
                                             };
-                                            tracing::info!(stats=?stats.statistics, "Loaded upload stats");
-                                            app_state.ui_update_tx.send(UiUpdate::UpdateUserUploads(stats)).ok();
+                                            tracing::info!(stats=?stats, "Loaded upload statistics");
+                                            app_state.ui_update_tx.send(UiUpdate::UpdateUserUploadStatistics(stats)).ok();
                                         }
                                     });
                                 }
                                 None => {
-                                    tracing::error!("API key and user ID not found, skipping upload stats load");
+                                    tracing::error!("API key and user ID not found, skipping upload statistics load");
+                                }
+                            }
+                        }
+                    }
+                    AsyncRequest::LoadUploadList { limit, offset } => {
+                        if app_state.offline.mode.load(Ordering::SeqCst) {
+                            tracing::info!("Offline mode enabled, skipping upload list load");
+                        } else {
+                            match valid_api_key_and_user_id.clone() {
+                                Some((api_key, user_id)) => {
+                                    let start_date = app_state.upload_filters.read().unwrap().start_date;
+                                    let end_date = app_state.upload_filters.read().unwrap().end_date;
+                                    tokio::spawn({
+                                        let app_state = app_state.clone();
+                                        let api_client = api_client.clone();
+                                        async move {
+                                            let (uploads, limit, offset) = match api_client.get_user_upload_list(&api_key, &user_id, limit, offset, start_date, end_date).await {
+                                                Ok(res) => res,
+                                                Err(e) => {
+                                                    tracing::error!(e=?e, "Failed to get user upload list");
+                                                    return;
+                                                }
+                                            };
+                                            tracing::info!(count=uploads.len(), "Loaded upload list");
+                                            app_state.ui_update_tx.send(UiUpdate::UpdateUserUploadList { uploads, limit, offset }).ok();
+                                        }
+                                    });
+                                }
+                                None => {
+                                    tracing::error!("API key and user ID not found, skipping upload list load");
                                 }
                             }
                         }
@@ -441,11 +477,19 @@ async fn main(
                         play_cue(&state.sink, &app_state, &cue, &mut state.cue_cache, |s| s);
                     }
                     AsyncRequest::UploadCompleted { uploaded_count } => {
-                        // Subtract the number of recordings that were just uploaded from the queue
                         let prev_count = app_state
                             .auto_upload_queue_count
                             .load(Ordering::SeqCst);
-                        let new_count = prev_count.saturating_sub(uploaded_count);
+
+                        // When a batch uploads nothing, the recordings in the queue
+                        // aren't ready yet (e.g. still being written). Clear the queue
+                        // to avoid a tight retry loop - the next recording completion
+                        // will trigger another upload attempt.
+                        let new_count = if uploaded_count == 0 {
+                            0
+                        } else {
+                            prev_count.saturating_sub(uploaded_count)
+                        };
 
                         tracing::info!(
                             "Upload completed: {} recordings uploaded, queue count {} -> {}",
@@ -453,6 +497,9 @@ async fn main(
                             prev_count,
                             new_count
                         );
+
+                        // Update queue count before triggering next batch
+                        set_auto_upload_queue_count(&app_state, new_count);
 
                         // If there are still queued recordings, start another upload batch
                         if new_count > 0 {
@@ -466,8 +513,6 @@ async fn main(
                                 .await
                                 .ok();
                         }
-
-                        set_auto_upload_queue_count(&app_state, new_count);
                     }
                     AsyncRequest::ClearAutoUploadQueue => {
                         let prev_count = app_state
@@ -501,7 +546,8 @@ async fn main(
                                 app_state.async_request_tx.send(AsyncRequest::CancelOfflineBackoff).await.ok();
                                 app_state.async_request_tx.send(AsyncRequest::ValidateApiKey { api_key }).await.ok();
                                 // Load data now that we're online
-                                app_state.async_request_tx.send(AsyncRequest::LoadUploadStats).await.ok();
+                                app_state.async_request_tx.send(AsyncRequest::LoadUploadStatistics).await.ok();
+                                app_state.async_request_tx.send(AsyncRequest::load_upload_list_default()).await.ok();
                                 app_state.async_request_tx.send(AsyncRequest::LoadLocalRecordings).await.ok();
                             },
                         }
